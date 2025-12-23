@@ -1,0 +1,16 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "1.0.0",
+  "FriendlyName": "KCP For Unreal Engine",
+  "Description": "KCP UDP transport plugin compatible with external KCP servers.",
+  "Category": "Networking",
+  "CreatedBy": "OpenAI",
+  "Modules": [
+    {
+      "Name": "KcpForUnrealEngine",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    }
+  ]
+}
