@@ -103,6 +103,7 @@ private:
     bool HasDerivedEncryptionKey() const;
     void RebuildEncryptionKey();
     void MarkConnected();
+    bool SendHandshakeProbe();
 
     bool bIsInitialized = false;
     bool bConnected = false;

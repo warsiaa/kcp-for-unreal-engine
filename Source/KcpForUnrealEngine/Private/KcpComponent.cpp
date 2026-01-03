@@ -361,7 +361,17 @@ bool UKcpComponent::Connect(const FString& RemoteIp, int32 RemotePort, int32 Loc
 
     bIsInitialized = true;
     UE_LOG(LogKcpComponent, Log, TEXT("KCP configured, waiting for remote packets"));
-    return true;
+
+    // Immediately send a small probe so KCP_SERVER can respond and complete the handshake
+    // even if the Blueprint graph waits for IsConnected() to become true.
+    if (!SendHandshakeProbe())
+    {
+        UE_LOG(LogKcpComponent, Warning, TEXT("Handshake probe could not be sent; waiting for remote packets regardless"));
+    }
+
+    // Return the current connection state so callers do not treat initialization as a successful
+    // connection until the remote endpoint replies.
+    return bConnected;
 }
 
 void UKcpComponent::Disconnect()
@@ -635,6 +645,42 @@ FSocket* UKcpComponent::GetSocket() const
 const TSharedPtr<FInternetAddr>& UKcpComponent::GetRemoteAddr() const
 {
     return RemoteAddr;
+}
+
+bool UKcpComponent::SendHandshakeProbe()
+{
+    if (!bIsInitialized || !Kcp || !Socket || !RemoteAddr.IsValid())
+    {
+        UE_LOG(LogKcpComponent, Warning, TEXT("Handshake probe skipped (Initialized=%s, KCP=%p, Socket=%p, Remote valid=%s)"),
+            bIsInitialized ? TEXT("true") : TEXT("false"), Kcp, Socket, RemoteAddr.IsValid() ? TEXT("true") : TEXT("false"));
+        return false;
+    }
+
+    // Minimal payload is enough to trigger KCP_SERVER to track the conversation and respond.
+    TArray<uint8> ProbePayload;
+    ProbePayload.Add(0x01);
+
+    const TArray<uint8>* PayloadToSend = &ProbePayload;
+    TArray<uint8> EncryptedPayload;
+    if (Settings.bEnableEncryption)
+    {
+        if (!EncryptBuffer(ProbePayload, EncryptedPayload))
+        {
+            UE_LOG(LogKcpComponent, Error, TEXT("Failed to encrypt handshake probe"));
+            return false;
+        }
+        PayloadToSend = &EncryptedPayload;
+    }
+
+    const int32 Result = ikcp_send(Kcp, reinterpret_cast<const char*>(PayloadToSend->GetData()), PayloadToSend->Num());
+    if (Result != 0)
+    {
+        UE_LOG(LogKcpComponent, Error, TEXT("ikcp_send failed for handshake probe with code %d"), Result);
+        return false;
+    }
+
+    UE_LOG(LogKcpComponent, Log, TEXT("Handshake probe queued (%d bytes, encryption %s)"), PayloadToSend->Num(), Settings.bEnableEncryption ? TEXT("on") : TEXT("off"));
+    return true;
 }
 
 void UKcpComponent::MarkConnected()
