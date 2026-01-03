@@ -4,8 +4,14 @@
 #include "SocketSubsystem.h"
 #include "IPAddress.h"
 #include "Kcp/ikcp.h"
-#include "Misc/AES.h"
 #include "Misc/SecureHash.h"
+#include "Runtime/Launch/Resources/Version.h"
+
+#if UE_VERSION_NEWER_THAN(5, 4, 0)
+#include "Crypto/AES.h"
+#else
+#include "Misc/AES.h"
+#endif
 #include "Logging/LogMacros.h"
 #include "Containers/StringConv.h"
 
@@ -13,6 +19,39 @@ DEFINE_LOG_CATEGORY_STATIC(LogKcpComponent, Log, All);
 
 namespace
 {
+#if UE_VERSION_NEWER_THAN(5, 4, 0)
+    FAES::FAESKey BuildAesKey(const TArray<uint8>& DerivedKey)
+    {
+        FAES::FAESKey AesKey;
+        AesKey.Set(DerivedKey.GetData());
+        return AesKey;
+    }
+
+    bool EncryptInPlace(TArray<uint8>& Data, const TArray<uint8>& DerivedKey)
+    {
+        const FAES::FAESKey AesKey = BuildAesKey(DerivedKey);
+        return FAES::EncryptData(Data.GetData(), Data.Num(), AesKey);
+    }
+
+    bool DecryptInPlace(TArray<uint8>& Data, const TArray<uint8>& DerivedKey)
+    {
+        const FAES::FAESKey AesKey = BuildAesKey(DerivedKey);
+        return FAES::DecryptData(Data.GetData(), Data.Num(), AesKey);
+    }
+#else
+    bool EncryptInPlace(TArray<uint8>& Data, const TArray<uint8>& DerivedKey)
+    {
+        FAES::EncryptData(Data.GetData(), Data.Num(), DerivedKey.GetData());
+        return true;
+    }
+
+    bool DecryptInPlace(TArray<uint8>& Data, const TArray<uint8>& DerivedKey)
+    {
+        FAES::DecryptData(Data.GetData(), Data.Num(), DerivedKey.GetData());
+        return true;
+    }
+#endif
+
     int32 KcpOutputCallback(const char* Buf, int32 Len, struct IKCPCB* Kcp, void* User)
     {
         if (!User || Len <= 0)
@@ -298,9 +337,14 @@ uint32 UKcpComponent::GetMs() const
     return static_cast<uint32>(FPlatformTime::ToMilliseconds64(FPlatformTime::Cycles64()));
 }
 
+bool UKcpComponent::HasDerivedEncryptionKey() const
+{
+    return Settings.bEnableEncryption && DerivedEncryptionKey.Num() > 0;
+}
+
 bool UKcpComponent::EncryptBuffer(const TArray<uint8>& InData, TArray<uint8>& OutData) const
 {
-    if (!Settings.bEnableEncryption || DerivedEncryptionKey.Num() == 0)
+    if (!HasDerivedEncryptionKey())
     {
         return false;
     }
@@ -313,13 +357,18 @@ bool UKcpComponent::EncryptBuffer(const TArray<uint8>& InData, TArray<uint8>& Ou
         OutData.AddZeroed(PaddingNeeded);
     }
 
-    FAES::EncryptData(OutData.GetData(), OutData.Num(), DerivedEncryptionKey.GetData());
-    return true;
+    const bool bSuccess = EncryptInPlace(OutData, DerivedEncryptionKey);
+    if (!bSuccess)
+    {
+        UE_LOG(LogKcpComponent, Error, TEXT("AES encryption failed"));
+    }
+
+    return bSuccess;
 }
 
 bool UKcpComponent::DecryptBuffer(const TArray<uint8>& InData, TArray<uint8>& OutData) const
 {
-    if (!Settings.bEnableEncryption || DerivedEncryptionKey.Num() == 0 || InData.Num() == 0)
+    if (!HasDerivedEncryptionKey() || InData.Num() == 0)
     {
         return false;
     }
@@ -331,8 +380,13 @@ bool UKcpComponent::DecryptBuffer(const TArray<uint8>& InData, TArray<uint8>& Ou
         return false;
     }
 
-    FAES::DecryptData(OutData.GetData(), OutData.Num(), DerivedEncryptionKey.GetData());
-    return true;
+    const bool bSuccess = DecryptInPlace(OutData, DerivedEncryptionKey);
+    if (!bSuccess)
+    {
+        UE_LOG(LogKcpComponent, Error, TEXT("AES decryption failed"));
+    }
+
+    return bSuccess;
 }
 
 void UKcpComponent::RebuildEncryptionKey()
