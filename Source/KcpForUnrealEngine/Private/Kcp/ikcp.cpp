@@ -736,7 +736,7 @@ void ikcp_flush(struct IKCPCB* kcp)
 
     kcp->probe = 0;
 
-    int cwnd = IKCP_MIN(kcp->snd_wnd, kcp->rmt_wnd);
+    uint32_t cwnd = IKCP_MIN(kcp->snd_wnd, kcp->rmt_wnd);
     if (!kcp->nocwnd)
     {
         cwnd = IKCP_MIN(kcp->cwnd, cwnd);
@@ -786,7 +786,7 @@ void ikcp_flush(struct IKCPCB* kcp)
             kcp->xmit++;
             if (kcp->nodelay == 0)
             {
-                segp->rto += IKCP_MAX(segp->rto, kcp->rx_rto);
+                segp->rto += IKCP_MAX(segp->rto, (uint32_t)kcp->rx_rto);
             }
             else
             {
@@ -858,7 +858,7 @@ static void ikcp_update_ack(struct IKCPCB* kcp, int rtt)
         }
     }
 
-    int rto = kcp->rx_srtt + IKCP_MAX(kcp->interval, 4 * kcp->rx_rttval);
+    int rto = kcp->rx_srtt + IKCP_MAX((int)kcp->interval, 4 * kcp->rx_rttval);
     kcp->rx_rto = IKCP_BOUND(kcp->rx_minrto, rto, IKCP_RTO_MAX);
 }
 
