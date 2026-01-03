@@ -12,22 +12,24 @@ DEFINE_LOG_CATEGORY_STATIC(LogKcpComponent, Log, All);
 
 namespace
 {
+    constexpr int32 AESKeyBytes = sizeof(FAES::FAESKey::Key);
+
     FAES::FAESKey BuildAesKey(const TArray<uint8>& DerivedKey)
     {
         FAES::FAESKey AesKey;
-        if (DerivedKey.Num() < FAES::AESKeyLength)
+        if (DerivedKey.Num() < AESKeyBytes)
         {
             return AesKey;
         }
 
-        FMemory::Memcpy(AesKey.Key, DerivedKey.GetData(), FAES::AESKeyLength);
+        FMemory::Memcpy(AesKey.Key, DerivedKey.GetData(), AESKeyBytes);
         return AesKey;
     }
 
     bool EncryptInPlace(TArray<uint8>& Data, const TArray<uint8>& DerivedKey)
     {
         const FAES::FAESKey AesKey = BuildAesKey(DerivedKey);
-        if (DerivedKey.Num() < FAES::AESKeyLength)
+        if (DerivedKey.Num() < AESKeyBytes)
         {
             return false;
         }
@@ -40,7 +42,7 @@ namespace
     bool DecryptInPlace(TArray<uint8>& Data, const TArray<uint8>& DerivedKey)
     {
         const FAES::FAESKey AesKey = BuildAesKey(DerivedKey);
-        if (DerivedKey.Num() < FAES::AESKeyLength)
+        if (DerivedKey.Num() < AESKeyBytes)
         {
             return false;
         }
@@ -521,7 +523,7 @@ uint32 UKcpComponent::GetMs() const
 
 bool UKcpComponent::HasDerivedEncryptionKey() const
 {
-    return Settings.bEnableEncryption && DerivedEncryptionKey.Num() >= FAES::AESKeyLength;
+    return Settings.bEnableEncryption && DerivedEncryptionKey.Num() >= AESKeyBytes;
 }
 
 bool UKcpComponent::EncryptBuffer(const TArray<uint8>& InData, TArray<uint8>& OutData) const
