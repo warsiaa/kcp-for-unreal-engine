@@ -15,7 +15,19 @@ DEFINE_LOG_CATEGORY_STATIC(LogKcpComponent, Log, All);
 
 namespace
 {
-#if UE_VERSION_NEWER_THAN(5, 4, 0)
+#if UE_VERSION_OLDER_THAN(5, 3, 0)
+    bool EncryptInPlace(TArray<uint8>& Data, const TArray<uint8>& DerivedKey)
+    {
+        FAES::EncryptData(Data.GetData(), Data.Num(), DerivedKey.GetData());
+        return true;
+    }
+
+    bool DecryptInPlace(TArray<uint8>& Data, const TArray<uint8>& DerivedKey)
+    {
+        FAES::DecryptData(Data.GetData(), Data.Num(), DerivedKey.GetData());
+        return true;
+    }
+#else
     FAES::FAESKey BuildAesKey(const TArray<uint8>& DerivedKey)
     {
         FAES::FAESKey AesKey;
@@ -35,18 +47,6 @@ namespace
         const FAES::FAESKey AesKey = BuildAesKey(DerivedKey);
         const uint64 DataSize = static_cast<uint64>(Data.Num());
         return FAES::DecryptData(Data.GetData(), DataSize, AesKey);
-    }
-#else
-    bool EncryptInPlace(TArray<uint8>& Data, const TArray<uint8>& DerivedKey)
-    {
-        FAES::EncryptData(Data.GetData(), Data.Num(), DerivedKey.GetData());
-        return true;
-    }
-
-    bool DecryptInPlace(TArray<uint8>& Data, const TArray<uint8>& DerivedKey)
-    {
-        FAES::DecryptData(Data.GetData(), Data.Num(), DerivedKey.GetData());
-        return true;
     }
 #endif
 
