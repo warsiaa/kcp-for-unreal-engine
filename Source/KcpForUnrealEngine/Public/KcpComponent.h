@@ -102,7 +102,10 @@ private:
     bool DecryptBuffer(const TArray<uint8>& InData, TArray<uint8>& OutData) const;
     bool HasDerivedEncryptionKey() const;
     void RebuildEncryptionKey();
+    void MarkConnected();
+    bool SendHandshakeProbe();
 
+    bool bIsInitialized = false;
     bool bConnected = false;
     int32 CurrentConversationId = 0;
 

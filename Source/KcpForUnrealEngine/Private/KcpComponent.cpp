@@ -52,6 +52,18 @@ namespace
         return true;
     }
 
+    FString DescribeLastSocketError(ISocketSubsystem* SocketSubsystem)
+    {
+        if (!SocketSubsystem)
+        {
+            return TEXT("socket subsystem unavailable");
+        }
+
+        const ESocketErrors LastError = SocketSubsystem->GetLastErrorCode();
+        const TCHAR* ErrorString = SocketSubsystem->GetSocketError(LastError);
+        return FString::Printf(TEXT("%s (%d)"), ErrorString ? ErrorString : TEXT("unknown socket error"), static_cast<int32>(LastError));
+    }
+
     int32 KcpOutputCallback(const char* Buf, int32 Len, struct IKCPCB* Kcp, void* User)
     {
         if (!User || Len <= 0)
@@ -60,11 +72,6 @@ namespace
         }
 
         UKcpComponent* Component = static_cast<UKcpComponent*>(User);
-        if (!Component->IsConnected())
-        {
-            return 0;
-        }
-
         FSocket* Socket = Component->GetSocket();
         const TSharedPtr<FInternetAddr>& RemoteAddr = Component->GetRemoteAddr();
         if (!Socket || !RemoteAddr.IsValid())
@@ -301,7 +308,7 @@ bool UKcpComponent::Connect(const FString& RemoteIp, int32 RemotePort, int32 Loc
     if (!Socket)
     {
         bConnectSuccess = false;
-        UE_LOG(LogKcpComponent, Error, TEXT("Failed to create UDP socket"));
+        UE_LOG(LogKcpComponent, Error, TEXT("Failed to create UDP socket: %s"), *DescribeLastSocketError(SocketSubsystem));
         return false;
     }
 
@@ -316,7 +323,7 @@ bool UKcpComponent::Connect(const FString& RemoteIp, int32 RemotePort, int32 Loc
     {
         bConnectSuccess = false;
         ShutdownSocket();
-        UE_LOG(LogKcpComponent, Error, TEXT("Failed to bind local port %d"), LocalPort);
+        UE_LOG(LogKcpComponent, Error, TEXT("Failed to bind local port %d: %s"), LocalPort, *DescribeLastSocketError(SocketSubsystem));
         return false;
     }
 
@@ -338,7 +345,7 @@ bool UKcpComponent::Connect(const FString& RemoteIp, int32 RemotePort, int32 Loc
     {
         bConnectSuccess = false;
         ShutdownSocket();
-        UE_LOG(LogKcpComponent, Error, TEXT("Failed to create KCP control block"));
+        UE_LOG(LogKcpComponent, Error, TEXT("Failed to create KCP control block for conv %d"), ConversationId);
         return false;
     }
 
@@ -352,14 +359,24 @@ bool UKcpComponent::Connect(const FString& RemoteIp, int32 RemotePort, int32 Loc
         Settings.FastResend, Settings.bDisableCongestionControl ? TEXT("on") : TEXT("off"),
         Settings.bEnableEncryption ? TEXT("on") : TEXT("off"));
 
-    bConnected = true;
-    bConnectSuccess = true;
-    UE_LOG(LogKcpComponent, Log, TEXT("KCP connected"));
-    return true;
+    bIsInitialized = true;
+    UE_LOG(LogKcpComponent, Log, TEXT("KCP configured, waiting for remote packets"));
+
+    // Immediately send a small probe so KCP_SERVER can respond and complete the handshake
+    // even if the Blueprint graph waits for IsConnected() to become true.
+    if (!SendHandshakeProbe())
+    {
+        UE_LOG(LogKcpComponent, Warning, TEXT("Handshake probe could not be sent; waiting for remote packets regardless"));
+    }
+
+    // Return the current connection state so callers do not treat initialization as a successful
+    // connection until the remote endpoint replies.
+    return bConnected;
 }
 
 void UKcpComponent::Disconnect()
 {
+    bIsInitialized = false;
     bConnected = false;
     bConnectSuccess = false;
     bSendPacketSuccess = false;
@@ -381,10 +398,16 @@ bool UKcpComponent::SendMessage(const TArray<uint8>& Data)
 {
     bSendPacketSuccess = false;
 
-    if (!bConnected || !Kcp)
+    if (!bIsInitialized || !Kcp || !Socket)
     {
-        UE_LOG(LogKcpComponent, Warning, TEXT("SendMessage called while not connected"));
+        UE_LOG(LogKcpComponent, Warning, TEXT("SendMessage called while not ready (Initialized=%s, KCP=%p, Socket=%p)"), bIsInitialized ? TEXT("true") : TEXT("false"), Kcp, Socket);
         return false;
+    }
+
+    if (!bConnected)
+    {
+        const FString RemoteDesc = RemoteAddr.IsValid() ? RemoteAddr->ToString(true) : TEXT("unknown remote");
+        UE_LOG(LogKcpComponent, Warning, TEXT("SendMessage called before a remote endpoint responded (target: %s)"), *RemoteDesc);
     }
 
     if (Data.Num() == 0)
@@ -406,7 +429,12 @@ bool UKcpComponent::SendMessage(const TArray<uint8>& Data)
     }
 
     int32 Result = ikcp_send(Kcp, reinterpret_cast<const char*>(PayloadToSend->GetData()), PayloadToSend->Num());
-    bSendPacketSuccess = Result == 0;
+    if (Result != 0)
+    {
+        UE_LOG(LogKcpComponent, Error, TEXT("ikcp_send failed with code %d (connected=%s, bytes=%d)"), Result, bConnected ? TEXT("true") : TEXT("false"), PayloadToSend->Num());
+    }
+
+    bSendPacketSuccess = bConnected && Result == 0;
     UE_LOG(LogKcpComponent, Log, TEXT("SendMessage result: %s (bytes %d)"), bSendPacketSuccess ? TEXT("success") : TEXT("fail"), PayloadToSend->Num());
     return bSendPacketSuccess;
 }
@@ -431,7 +459,7 @@ void UKcpComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorCo
 {
     Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 
-    if (!bConnected || !Kcp || !Socket)
+    if (!bIsInitialized || !Kcp || !Socket)
     {
         return;
     }
@@ -472,7 +500,23 @@ void UKcpComponent::FlushIncoming()
         if (Socket->RecvFrom(Buffer.GetData(), Buffer.Num(), BytesRead, *Sender))
         {
             UE_LOG(LogKcpComponent, Verbose, TEXT("Received %d bytes from %s"), BytesRead, *Sender->ToString(true));
-            ikcp_input(Kcp, reinterpret_cast<const char*>(Buffer.GetData()), BytesRead);
+
+            if (!bConnected && RemoteAddr.IsValid() && Sender->CompareEndpoints(*RemoteAddr))
+            {
+                MarkConnected();
+            }
+
+            const int32 InputResult = ikcp_input(Kcp, reinterpret_cast<const char*>(Buffer.GetData()), BytesRead);
+            if (InputResult < 0)
+            {
+                UE_LOG(LogKcpComponent, Warning, TEXT("ikcp_input error %d while processing %d bytes from %s"), InputResult, BytesRead, *Sender->ToString(true));
+            }
+        }
+        else
+        {
+            ISocketSubsystem* SocketSubsystem = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
+            UE_LOG(LogKcpComponent, Warning, TEXT("RecvFrom failed while pending %u bytes: %s"), PendingSize, *DescribeLastSocketError(SocketSubsystem));
+            break;
         }
     }
 }
@@ -530,6 +574,7 @@ bool UKcpComponent::EncryptBuffer(const TArray<uint8>& InData, TArray<uint8>& Ou
 {
     if (!HasDerivedEncryptionKey())
     {
+        UE_LOG(LogKcpComponent, Error, TEXT("EncryptBuffer called without a derived AES key (encryption enabled: %s)"), Settings.bEnableEncryption ? TEXT("true") : TEXT("false"));
         return false;
     }
 
@@ -554,6 +599,7 @@ bool UKcpComponent::DecryptBuffer(const TArray<uint8>& InData, TArray<uint8>& Ou
 {
     if (!HasDerivedEncryptionKey() || InData.Num() == 0)
     {
+        UE_LOG(LogKcpComponent, Error, TEXT("DecryptBuffer called without key or with empty input (hasKey=%s, bytes=%d)"), HasDerivedEncryptionKey() ? TEXT("true") : TEXT("false"), InData.Num());
         return false;
     }
 
@@ -599,4 +645,52 @@ FSocket* UKcpComponent::GetSocket() const
 const TSharedPtr<FInternetAddr>& UKcpComponent::GetRemoteAddr() const
 {
     return RemoteAddr;
+}
+
+bool UKcpComponent::SendHandshakeProbe()
+{
+    if (!bIsInitialized || !Kcp || !Socket || !RemoteAddr.IsValid())
+    {
+        UE_LOG(LogKcpComponent, Warning, TEXT("Handshake probe skipped (Initialized=%s, KCP=%p, Socket=%p, Remote valid=%s)"),
+            bIsInitialized ? TEXT("true") : TEXT("false"), Kcp, Socket, RemoteAddr.IsValid() ? TEXT("true") : TEXT("false"));
+        return false;
+    }
+
+    // Minimal payload is enough to trigger KCP_SERVER to track the conversation and respond.
+    TArray<uint8> ProbePayload;
+    ProbePayload.Add(0x01);
+
+    const TArray<uint8>* PayloadToSend = &ProbePayload;
+    TArray<uint8> EncryptedPayload;
+    if (Settings.bEnableEncryption)
+    {
+        if (!EncryptBuffer(ProbePayload, EncryptedPayload))
+        {
+            UE_LOG(LogKcpComponent, Error, TEXT("Failed to encrypt handshake probe"));
+            return false;
+        }
+        PayloadToSend = &EncryptedPayload;
+    }
+
+    const int32 Result = ikcp_send(Kcp, reinterpret_cast<const char*>(PayloadToSend->GetData()), PayloadToSend->Num());
+    if (Result != 0)
+    {
+        UE_LOG(LogKcpComponent, Error, TEXT("ikcp_send failed for handshake probe with code %d"), Result);
+        return false;
+    }
+
+    UE_LOG(LogKcpComponent, Log, TEXT("Handshake probe queued (%d bytes, encryption %s)"), PayloadToSend->Num(), Settings.bEnableEncryption ? TEXT("on") : TEXT("off"));
+    return true;
+}
+
+void UKcpComponent::MarkConnected()
+{
+    if (bConnected)
+    {
+        return;
+    }
+
+    bConnected = true;
+    bConnectSuccess = true;
+    UE_LOG(LogKcpComponent, Log, TEXT("KCP connected"));
 }
