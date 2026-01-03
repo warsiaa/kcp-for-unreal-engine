@@ -100,6 +100,7 @@ private:
 
     bool EncryptBuffer(const TArray<uint8>& InData, TArray<uint8>& OutData) const;
     bool DecryptBuffer(const TArray<uint8>& InData, TArray<uint8>& OutData) const;
+    bool HasDerivedEncryptionKey() const;
     void RebuildEncryptionKey();
 
     bool bConnected = false;
