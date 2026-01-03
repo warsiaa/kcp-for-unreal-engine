@@ -47,6 +47,12 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "KCP")
     FKcpSettings Settings;
 
+    UPROPERTY(BlueprintReadOnly, Category = "KCP")
+    bool bConnectSuccess = false;
+
+    UPROPERTY(BlueprintReadOnly, Category = "KCP")
+    bool bSendPacketSuccess = false;
+
     UFUNCTION(BlueprintCallable, Category = "KCP")
     bool Connect(const FString& RemoteIp, int32 RemotePort, int32 LocalPort, int32 ConversationId);
 

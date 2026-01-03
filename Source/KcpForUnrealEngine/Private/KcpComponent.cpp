@@ -53,15 +53,21 @@ bool UKcpComponent::Connect(const FString& RemoteIp, int32 RemotePort, int32 Loc
 {
     Disconnect();
 
+    bConnectSuccess = false;
+
+    bSendPacketSuccess = false;
+
     ISocketSubsystem* SocketSubsystem = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
     if (!SocketSubsystem)
     {
+        bConnectSuccess = false;
         return false;
     }
 
     Socket = SocketSubsystem->CreateSocket(NAME_DGram, TEXT("KCP"), false);
     if (!Socket)
     {
+        bConnectSuccess = false;
         return false;
     }
 
@@ -74,6 +80,7 @@ bool UKcpComponent::Connect(const FString& RemoteIp, int32 RemotePort, int32 Loc
     LocalAddr->SetPort(LocalPort);
     if (!Socket->Bind(*LocalAddr))
     {
+        bConnectSuccess = false;
         ShutdownSocket();
         return false;
     }
@@ -84,6 +91,7 @@ bool UKcpComponent::Connect(const FString& RemoteIp, int32 RemotePort, int32 Loc
     RemoteAddr->SetPort(RemotePort);
     if (!bIsValid)
     {
+        bConnectSuccess = false;
         ShutdownSocket();
         return false;
     }
@@ -92,6 +100,7 @@ bool UKcpComponent::Connect(const FString& RemoteIp, int32 RemotePort, int32 Loc
     Kcp = ikcp_create(CurrentConversationId, this);
     if (!Kcp)
     {
+        bConnectSuccess = false;
         ShutdownSocket();
         return false;
     }
@@ -101,12 +110,15 @@ bool UKcpComponent::Connect(const FString& RemoteIp, int32 RemotePort, int32 Loc
     ikcp_nodelay(Kcp, Settings.bNoDelay ? 1 : 0, Settings.IntervalMs, Settings.FastResend, Settings.bDisableCongestionControl ? 1 : 0);
 
     bConnected = true;
+    bConnectSuccess = true;
     return true;
 }
 
 void UKcpComponent::Disconnect()
 {
     bConnected = false;
+    bConnectSuccess = false;
+    bSendPacketSuccess = false;
 
     if (Kcp)
     {
@@ -120,6 +132,8 @@ void UKcpComponent::Disconnect()
 
 bool UKcpComponent::SendMessage(const TArray<uint8>& Data)
 {
+    bSendPacketSuccess = false;
+
     if (!bConnected || !Kcp)
     {
         return false;
@@ -131,7 +145,8 @@ bool UKcpComponent::SendMessage(const TArray<uint8>& Data)
     }
 
     int32 Result = ikcp_send(Kcp, reinterpret_cast<const char*>(Data.GetData()), Data.Num());
-    return Result == 0;
+    bSendPacketSuccess = Result == 0;
+    return bSendPacketSuccess;
 }
 
 bool UKcpComponent::IsConnected() const
