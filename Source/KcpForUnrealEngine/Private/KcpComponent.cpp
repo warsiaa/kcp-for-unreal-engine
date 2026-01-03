@@ -4,9 +4,6 @@
 #include "SocketSubsystem.h"
 #include "IPAddress.h"
 #include "Kcp/ikcp.h"
-#include "Misc/SecureHash.h"
-#include "Runtime/Launch/Resources/Version.h"
-
 #include "Misc/AES.h"
 #include "Logging/LogMacros.h"
 #include "Containers/StringConv.h"
@@ -15,40 +12,43 @@ DEFINE_LOG_CATEGORY_STATIC(LogKcpComponent, Log, All);
 
 namespace
 {
-#if UE_VERSION_OLDER_THAN(5, 3, 0)
-    bool EncryptInPlace(TArray<uint8>& Data, const TArray<uint8>& DerivedKey)
-    {
-        FAES::EncryptData(Data.GetData(), Data.Num(), DerivedKey.GetData());
-        return true;
-    }
-
-    bool DecryptInPlace(TArray<uint8>& Data, const TArray<uint8>& DerivedKey)
-    {
-        FAES::DecryptData(Data.GetData(), Data.Num(), DerivedKey.GetData());
-        return true;
-    }
-#else
     FAES::FAESKey BuildAesKey(const TArray<uint8>& DerivedKey)
     {
         FAES::FAESKey AesKey;
-        AesKey.Set(DerivedKey.GetData());
+        if (DerivedKey.Num() < FAES::AESKeyLength)
+        {
+            return AesKey;
+        }
+
+        FMemory::Memcpy(AesKey.Key, DerivedKey.GetData(), FAES::AESKeyLength);
         return AesKey;
     }
 
     bool EncryptInPlace(TArray<uint8>& Data, const TArray<uint8>& DerivedKey)
     {
         const FAES::FAESKey AesKey = BuildAesKey(DerivedKey);
+        if (DerivedKey.Num() < FAES::AESKeyLength)
+        {
+            return false;
+        }
+
         const uint64 DataSize = static_cast<uint64>(Data.Num());
-        return FAES::EncryptData(Data.GetData(), DataSize, AesKey);
+        FAES::EncryptData(Data.GetData(), DataSize, AesKey);
+        return true;
     }
 
     bool DecryptInPlace(TArray<uint8>& Data, const TArray<uint8>& DerivedKey)
     {
         const FAES::FAESKey AesKey = BuildAesKey(DerivedKey);
+        if (DerivedKey.Num() < FAES::AESKeyLength)
+        {
+            return false;
+        }
+
         const uint64 DataSize = static_cast<uint64>(Data.Num());
-        return FAES::DecryptData(Data.GetData(), DataSize, AesKey);
+        FAES::DecryptData(Data.GetData(), DataSize, AesKey);
+        return true;
     }
-#endif
 
     int32 KcpOutputCallback(const char* Buf, int32 Len, struct IKCPCB* Kcp, void* User)
     {
@@ -76,12 +76,6 @@ namespace
         return 0;
     }
 
-#if UE_VERSION_OLDER_THAN(5, 3, 0)
-    void HashSha256(const void* Data, int32 Length, uint8 Out[32])
-    {
-        FSHA256::HashBuffer(Data, Length, Out);
-    }
-#else
     namespace Sha256
     {
         constexpr uint32 BlockSize = 64;
@@ -265,7 +259,6 @@ namespace
         Sha256::Update(Context, static_cast<const uint8*>(Data), Length);
         Sha256::Final(Context, Out);
     }
-#endif
 }
 
 UKcpComponent::UKcpComponent()
@@ -528,7 +521,7 @@ uint32 UKcpComponent::GetMs() const
 
 bool UKcpComponent::HasDerivedEncryptionKey() const
 {
-    return Settings.bEnableEncryption && DerivedEncryptionKey.Num() > 0;
+    return Settings.bEnableEncryption && DerivedEncryptionKey.Num() >= FAES::AESKeyLength;
 }
 
 bool UKcpComponent::EncryptBuffer(const TArray<uint8>& InData, TArray<uint8>& OutData) const
