@@ -4,6 +4,12 @@
 #include "SocketSubsystem.h"
 #include "IPAddress.h"
 #include "Kcp/ikcp.h"
+#include "Misc/AES.h"
+#include "Misc/SecureHash.h"
+#include "Logging/LogMacros.h"
+#include "Containers/StringConv.h"
+
+DEFINE_LOG_CATEGORY_STATIC(LogKcpComponent, Log, All);
 
 namespace
 {
@@ -29,6 +35,7 @@ namespace
 
         int32 BytesSent = 0;
         Socket->SendTo(reinterpret_cast<const uint8*>(Buf), Len, BytesSent, *RemoteAddr);
+        UE_LOG(LogKcpComponent, Verbose, TEXT("KCP sent %d bytes"), BytesSent);
         return 0;
     }
 }
@@ -57,10 +64,13 @@ bool UKcpComponent::Connect(const FString& RemoteIp, int32 RemotePort, int32 Loc
 
     bSendPacketSuccess = false;
 
+    UE_LOG(LogKcpComponent, Log, TEXT("Starting KCP connect to %s:%d (local port %d, conv %d)"), *RemoteIp, RemotePort, LocalPort, ConversationId);
+
     ISocketSubsystem* SocketSubsystem = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
     if (!SocketSubsystem)
     {
         bConnectSuccess = false;
+        UE_LOG(LogKcpComponent, Error, TEXT("Socket subsystem missing"));
         return false;
     }
 
@@ -68,6 +78,7 @@ bool UKcpComponent::Connect(const FString& RemoteIp, int32 RemotePort, int32 Loc
     if (!Socket)
     {
         bConnectSuccess = false;
+        UE_LOG(LogKcpComponent, Error, TEXT("Failed to create UDP socket"));
         return false;
     }
 
@@ -82,6 +93,7 @@ bool UKcpComponent::Connect(const FString& RemoteIp, int32 RemotePort, int32 Loc
     {
         bConnectSuccess = false;
         ShutdownSocket();
+        UE_LOG(LogKcpComponent, Error, TEXT("Failed to bind local port %d"), LocalPort);
         return false;
     }
 
@@ -93,6 +105,7 @@ bool UKcpComponent::Connect(const FString& RemoteIp, int32 RemotePort, int32 Loc
     {
         bConnectSuccess = false;
         ShutdownSocket();
+        UE_LOG(LogKcpComponent, Error, TEXT("Remote IP %s is not valid"), *RemoteIp);
         return false;
     }
 
@@ -102,6 +115,7 @@ bool UKcpComponent::Connect(const FString& RemoteIp, int32 RemotePort, int32 Loc
     {
         bConnectSuccess = false;
         ShutdownSocket();
+        UE_LOG(LogKcpComponent, Error, TEXT("Failed to create KCP control block"));
         return false;
     }
 
@@ -109,8 +123,15 @@ bool UKcpComponent::Connect(const FString& RemoteIp, int32 RemotePort, int32 Loc
     ikcp_wndsize(Kcp, Settings.SendWindowSize, Settings.ReceiveWindowSize);
     ikcp_nodelay(Kcp, Settings.bNoDelay ? 1 : 0, Settings.IntervalMs, Settings.FastResend, Settings.bDisableCongestionControl ? 1 : 0);
 
+    RebuildEncryptionKey();
+    UE_LOG(LogKcpComponent, Log, TEXT("KCP configured (wnd %d/%d, nodelay %s, interval %dms, fastresend %d, no-congestion %s, encryption %s)"),
+        Settings.SendWindowSize, Settings.ReceiveWindowSize, Settings.bNoDelay ? TEXT("on") : TEXT("off"), Settings.IntervalMs,
+        Settings.FastResend, Settings.bDisableCongestionControl ? TEXT("on") : TEXT("off"),
+        Settings.bEnableEncryption ? TEXT("on") : TEXT("off"));
+
     bConnected = true;
     bConnectSuccess = true;
+    UE_LOG(LogKcpComponent, Log, TEXT("KCP connected"));
     return true;
 }
 
@@ -120,10 +141,13 @@ void UKcpComponent::Disconnect()
     bConnectSuccess = false;
     bSendPacketSuccess = false;
 
+    UE_LOG(LogKcpComponent, Log, TEXT("KCP disconnect requested"));
+
     if (Kcp)
     {
         ikcp_release(Kcp);
         Kcp = nullptr;
+        UE_LOG(LogKcpComponent, Verbose, TEXT("KCP control block released"));
     }
 
     ShutdownSocket();
@@ -136,17 +160,43 @@ bool UKcpComponent::SendMessage(const TArray<uint8>& Data)
 
     if (!bConnected || !Kcp)
     {
+        UE_LOG(LogKcpComponent, Warning, TEXT("SendMessage called while not connected"));
         return false;
     }
 
     if (Data.Num() == 0)
     {
+        UE_LOG(LogKcpComponent, Warning, TEXT("SendMessage called with empty payload"));
         return false;
     }
 
-    int32 Result = ikcp_send(Kcp, reinterpret_cast<const char*>(Data.GetData()), Data.Num());
+    const TArray<uint8>* PayloadToSend = &Data;
+    TArray<uint8> EncryptedPayload;
+    if (Settings.bEnableEncryption)
+    {
+        if (!EncryptBuffer(Data, EncryptedPayload))
+        {
+            UE_LOG(LogKcpComponent, Error, TEXT("Failed to encrypt payload"));
+            return false;
+        }
+        PayloadToSend = &EncryptedPayload;
+    }
+
+    int32 Result = ikcp_send(Kcp, reinterpret_cast<const char*>(PayloadToSend->GetData()), PayloadToSend->Num());
     bSendPacketSuccess = Result == 0;
+    UE_LOG(LogKcpComponent, Log, TEXT("SendMessage result: %s (bytes %d)"), bSendPacketSuccess ? TEXT("success") : TEXT("fail"), PayloadToSend->Num());
     return bSendPacketSuccess;
+}
+
+TArray<uint8> UKcpComponent::BuildPacket(const FString& TextPayload, const TArray<uint8>& ExtraBytes)
+{
+    TArray<uint8> Output;
+
+    FTCHARToUTF8 Converter(*TextPayload);
+    Output.Append(reinterpret_cast<const uint8*>(Converter.Get()), Converter.Length());
+    Output.Append(ExtraBytes);
+
+    return Output;
 }
 
 bool UKcpComponent::IsConnected() const
@@ -198,6 +248,7 @@ void UKcpComponent::FlushIncoming()
         TSharedRef<FInternetAddr> Sender = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM)->CreateInternetAddr();
         if (Socket->RecvFrom(Buffer.GetData(), Buffer.Num(), BytesRead, *Sender))
         {
+            UE_LOG(LogKcpComponent, Verbose, TEXT("Received %d bytes from %s"), BytesRead, *Sender->ToString(true));
             ikcp_input(Kcp, reinterpret_cast<const char*>(Buffer.GetData()), BytesRead);
         }
     }
@@ -220,7 +271,22 @@ void UKcpComponent::FlushKcpReceive()
         if (BytesReceived > 0)
         {
             Buffer.SetNum(BytesReceived);
-            OnMessageReceived.Broadcast(Buffer);
+            UE_LOG(LogKcpComponent, Verbose, TEXT("KCP delivered %d bytes"), BytesReceived);
+
+            const TArray<uint8>* DataToBroadcast = &Buffer;
+            TArray<uint8> DecryptedBuffer;
+            if (Settings.bEnableEncryption)
+            {
+                if (!DecryptBuffer(Buffer, DecryptedBuffer))
+                {
+                    UE_LOG(LogKcpComponent, Error, TEXT("Failed to decrypt received payload"));
+                    break;
+                }
+
+                DataToBroadcast = &DecryptedBuffer;
+            }
+
+            OnMessageReceived.Broadcast(*DataToBroadcast);
         }
 
         PeekSize = ikcp_peeksize(Kcp);
@@ -230,6 +296,61 @@ void UKcpComponent::FlushKcpReceive()
 uint32 UKcpComponent::GetMs() const
 {
     return static_cast<uint32>(FPlatformTime::ToMilliseconds64(FPlatformTime::Cycles64()));
+}
+
+bool UKcpComponent::EncryptBuffer(const TArray<uint8>& InData, TArray<uint8>& OutData) const
+{
+    if (!Settings.bEnableEncryption || DerivedEncryptionKey.Num() == 0)
+    {
+        return false;
+    }
+
+    OutData = InData;
+    const int32 BlockSize = FAES::AESBlockSize;
+    const int32 PaddingNeeded = BlockSize - (OutData.Num() % BlockSize);
+    if (PaddingNeeded > 0 && PaddingNeeded < BlockSize)
+    {
+        OutData.AddZeroed(PaddingNeeded);
+    }
+
+    FAES::EncryptData(OutData.GetData(), OutData.Num(), DerivedEncryptionKey.GetData());
+    return true;
+}
+
+bool UKcpComponent::DecryptBuffer(const TArray<uint8>& InData, TArray<uint8>& OutData) const
+{
+    if (!Settings.bEnableEncryption || DerivedEncryptionKey.Num() == 0 || InData.Num() == 0)
+    {
+        return false;
+    }
+
+    OutData = InData;
+    if (OutData.Num() % FAES::AESBlockSize != 0)
+    {
+        UE_LOG(LogKcpComponent, Error, TEXT("Encrypted payload size %d is not aligned to AES block size"), OutData.Num());
+        return false;
+    }
+
+    FAES::DecryptData(OutData.GetData(), OutData.Num(), DerivedEncryptionKey.GetData());
+    return true;
+}
+
+void UKcpComponent::RebuildEncryptionKey()
+{
+    DerivedEncryptionKey.Reset();
+
+    if (!Settings.bEnableEncryption || Settings.EncryptionKey.IsEmpty())
+    {
+        UE_LOG(LogKcpComponent, Log, TEXT("Encryption disabled"));
+        return;
+    }
+
+    FTCHARToUTF8 Converter(*Settings.EncryptionKey);
+    uint8 HashedKey[32];
+    FSHA256::HashBuffer(Converter.Get(), Converter.Length(), HashedKey);
+
+    DerivedEncryptionKey.Append(HashedKey, 32);
+    UE_LOG(LogKcpComponent, Log, TEXT("Encryption key derived (SHA-256)"));
 }
 
 FSocket* UKcpComponent::GetSocket() const

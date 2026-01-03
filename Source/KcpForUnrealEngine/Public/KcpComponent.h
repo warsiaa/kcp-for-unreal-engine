@@ -31,6 +31,19 @@ struct FKcpSettings
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "KCP")
     bool bDisableCongestionControl = true;
+
+    /**
+     * KCP_SERVER ile eşleşen şifreleme anahtarı. Boş bırakılırsa şifreleme yapılmaz.
+     * Anahtar, AES-256 için 32 byte'a SHA-256 ile dönüştürülür.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "KCP|Encryption")
+    FString EncryptionKey;
+
+    /**
+     * Şifrelemeyi aç/kapa. Açık olduğunda gönderilen ve alınan tüm paketler AES-256 ile şifrelenir.
+     */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "KCP|Encryption")
+    bool bEnableEncryption = false;
 };
 
 UCLASS(ClassGroup = (Networking), meta = (BlueprintSpawnableComponent))
@@ -62,6 +75,12 @@ public:
     UFUNCTION(BlueprintCallable, Category = "KCP")
     bool SendMessage(const TArray<uint8>& Data);
 
+    /**
+     * UTF-8 string ve ekstra ham byte ekleriyle paket oluşturmak için yardımcı Blueprint düğümü.
+     */
+    UFUNCTION(BlueprintCallable, Category = "KCP", meta = (DisplayName = "Build KCP Packet"))
+    static TArray<uint8> BuildPacket(const FString& TextPayload, const TArray<uint8>& ExtraBytes);
+
     UFUNCTION(BlueprintCallable, Category = "KCP")
     bool IsConnected() const;
 
@@ -79,8 +98,14 @@ private:
     void FlushKcpReceive();
     uint32 GetMs() const;
 
+    bool EncryptBuffer(const TArray<uint8>& InData, TArray<uint8>& OutData) const;
+    bool DecryptBuffer(const TArray<uint8>& InData, TArray<uint8>& OutData) const;
+    void RebuildEncryptionKey();
+
     bool bConnected = false;
     int32 CurrentConversationId = 0;
+
+    TArray<uint8> DerivedEncryptionKey;
 
     class FSocket* Socket = nullptr;
     TSharedPtr<class FInternetAddr> RemoteAddr;
